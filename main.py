@@ -4,13 +4,16 @@ import json
 import sqlite3
 import re
 import base64
+import io
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from openai import OpenAI
 from dotenv import load_dotenv
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional
+# 오디오 처리를 위한 라이브러리
+from pydub import AudioSegment
 
 # 1. 환경 설정
 load_dotenv()
@@ -31,8 +34,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 이미지 저장소
+# 이미지 및 임시 오디오 저장소 생성
 os.makedirs("static/images", exist_ok=True)
+os.makedirs("temp_audio", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # --- 💾 DB 초기화 ---
@@ -43,7 +47,7 @@ def init_db():
         with sqlite3.connect(DB_NAME) as conn:
             cursor = conn.cursor()
 
-            # 사용자 테이블 (확장됨)
+            # 사용자 테이블
             cursor.execute('''
                            CREATE TABLE IF NOT EXISTS users (
                                                                 username TEXT PRIMARY KEY,
@@ -71,7 +75,7 @@ def init_db():
             cursor.execute("INSERT OR IGNORE INTO users (username, password, role, full_name) VALUES ('admin', 'admin', 'admin', 'Admin')")
             cursor.execute("INSERT OR IGNORE INTO users (username, password, role, full_name) VALUES ('user', 'user', 'user', 'Tester')")
 
-            # [데이터 복구] 12개 기초 회화 + 3개 오프라인 퀘스트
+            # 데이터 복구 (12개 기초 회화 + 3개 오프라인 퀘스트)
             seed_data = [
                 # Basic Training (12개)
                 ("kpop", "basic", "🎤 K-POP 콘서트", "Free", "5.0", "", "콘서트장 상황극", "열정적인 MC", "콘서트장", "응원하기", '["Scream!", "Encore!"]'),
@@ -103,23 +107,25 @@ def init_db():
 
 init_db()
 
-# --- Helper: JSON Clean ---
-def clean_json(text):
-    try:
-        text = re.sub(r'```json\s*', '', text)
-        text = re.sub(r'```', '', text)
-        match = re.search(r'\{.*\}', text, re.DOTALL)
-        return json.loads(match.group()) if match else json.loads(text)
-    except:
-        # Fallback JSON
-        return {
-            "korean_sentence": "다시 말씀해 주세요.",
-            "romanized": "Dasi mal-hae-juseyo",
-            "eng_meaning": "Please say it again.",
-            "kor_explanation": "잘 못 들었습니다.",
-            "eng_explanation": "I couldn't hear you well.",
-            "feedback": ""
-        }
+# --- JSON Structured Output Models ---
+class FeedbackStructure(BaseModel):
+    pronunciationScore: int = Field(description="Score between 0 and 100")
+    intonationCheck: str = Field(description="Advice on intonation and tone")
+    reviewSentences: List[str] = Field(description="List of sentences to review")
+
+class NativeSentence(BaseModel):
+    korean: str
+    english: str
+    romanized: str
+    metadata: str = Field(description="Context info (e.g. Politeness level)")
+
+class EducationResponse(BaseModel):
+    scenarioType: str = Field(description="Tag for the scenario (e.g., cafe_order)")
+    difficultyLevel: int = Field(description="Difficulty level 1-5")
+    nativeSentences: List[NativeSentence]
+    learningFlow: List[str] = Field(description="Steps for learning")
+    feedbackStructure: FeedbackStructure
+    kor_explanation: str = Field(description="Friendly explanation in Korean")
 
 # --- Models ---
 class AuthRequest(BaseModel):
@@ -219,12 +225,12 @@ def cancel(req: CancelRequest):
         conn.commit()
     return {"status": "success"}
 
-# --- [핵심 수정] AI Talk (오디오 포맷 및 로직 강화) ---
+# --- [핵심 기능] AI Talk: JSON Structured Output & Audio Sequencing ---
 @app.post("/talk")
 async def talk_to_ai(file: UploadFile = File(...), theme_id: str = Form(...)):
-    # 1. 파일 저장 (확장자 유지)
+    # 1. 파일 저장
     filename = file.filename
-    temp_filename = f"temp_{filename}"
+    temp_filename = f"temp_audio/input_{filename}"
 
     try:
         with open(temp_filename, "wb") as buffer:
@@ -237,71 +243,100 @@ async def talk_to_ai(file: UploadFile = File(...), theme_id: str = Form(...)):
                 file=audio_file,
                 language="en"
             )
-
         user_text = transcript.text
         if len(user_text.strip()) < 1:
             return {"error": "No voice detected"}
 
-        # 3. DB에서 페르소나 조회
-        persona, situation = "Tutor", "Practice"
+        # 3. DB 페르소나 조회
+        persona, situation = "Tutor", "General Practice"
         try:
             with sqlite3.connect(DB_NAME) as conn:
                 row = conn.cursor().execute("SELECT persona, situation FROM products WHERE id=?", (theme_id,)).fetchone()
                 if row: persona, situation = row
         except: pass
 
-        # 4. LLM 호출
+        # 4. LLM 호출 (JSON Structured Output)
         SYSTEM_PROMPT = f"""
         Role: You are '{persona}' in '{situation}'.
-        Task: User speaks English. 
-        1. Translate to Korean. 
-        2. Romanize it. 
-        3. Explain in Korean & English.
-        4. Return JSON ONLY.
-        {{
-            "korean_sentence": "...",
-            "romanized": "...",
-            "eng_meaning": "...",
-            "kor_explanation": "...",
-            "eng_explanation": "...",
-            "feedback": "..."
-        }}
+        Task: User speaks English. Teach them the most natural Korean expression for this exact situation.
+        Output Requirement: Respond strictly in JSON format based on this structure:
+        - scenarioType: Define the current scenario tag (e.g. cafe, greeting).
+        - difficultyLevel: 1(Easy) to 5(Hard).
+        - nativeSentences: A list containing one object with 'korean', 'english', 'romanized', and 'metadata'.
+        - feedbackStructure: 'pronunciationScore' (0-100), 'intonationCheck' (advice), 'reviewSentences'.
+        - kor_explanation: A friendly explanation of the expression and nuance.
         """
 
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": f"User said: '{user_text}'"}],
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": f"User said: '{user_text}'. Return JSON."}
+            ],
             response_format={ "type": "json_object" }
         )
 
-        data = clean_json(response.choices[0].message.content)
+        raw_json = response.choices[0].message.content
+        data = json.loads(raw_json)
 
-        # 5. TTS 생성 (문장 -> 설명 -> 5회 반복)
-        k_sent = data.get('korean_sentence', '')
-        k_expl = data.get('kor_explanation', '')
-        tts_text = f"{k_sent}. {k_expl}. 자, 5번 반복합니다. " + ", ".join([k_sent] * 5)
+        # 데이터 추출
+        try:
+            target_sent = data["nativeSentences"][0]["korean"]
+            explanation = data["kor_explanation"]
+        except:
+            target_sent = "다시 말씀해 주세요."
+            explanation = "이해하지 못했습니다."
 
-        tts_res = openai_client.audio.speech.create(model="tts-1", voice="nova", input=tts_text)
-        audio_b64 = base64.b64encode(tts_res.content).decode('utf-8')
+        # 5. [Server-Side Audio Sequencing]
+        # 패턴: [원문 1.0x] -> [설명 1.0x] -> [원문 0.5x (2회)] -> [원문 1.0x (2회)] -> [원문 1.2x (1회)]
+
+        def generate_tts_segment(text, speed, suffix):
+            if not text: return AudioSegment.silent(duration=100)
+
+            # OpenAI TTS (speed range: 0.25 ~ 4.0)
+            res = openai_client.audio.speech.create(
+                model="tts-1", voice="nova", input=text, speed=speed
+            )
+            seg_path = f"temp_audio/seg_{suffix}.mp3"
+            res.stream_to_file(seg_path)
+            return AudioSegment.from_mp3(seg_path)
+
+        # (1) 오디오 조각 생성
+        seg_normal = generate_tts_segment(target_sent, 1.0, "normal")
+        seg_expl = generate_tts_segment(explanation, 1.0, "expl")
+        seg_slow = generate_tts_segment(target_sent, 0.5, "slow")  # 느리게
+        seg_fast = generate_tts_segment(target_sent, 1.2, "fast")  # 빠르게
+        silence_short = AudioSegment.silent(duration=500)  # 0.5초 침묵
+        silence_long = AudioSegment.silent(duration=1000) # 1초 침묵
+
+        # (2) 병합 (Sequencing)
+        combined_audio = (
+                seg_normal + silence_long +          # 1. 원문 듣기
+                seg_expl + silence_long +            # 2. 설명 듣기
+                (seg_slow + silence_short) * 2 +     # 3. 느리게 2번 반복
+                (seg_normal + silence_short) * 2 +   # 4. 보통 속도 2번 반복
+                (seg_fast + silence_short)           # 5. 빠르게 1번 마무리
+        )
+
+        # (3) Base64 변환
+        output_buffer = io.BytesIO()
+        combined_audio.export(output_buffer, format="mp3")
+        audio_b64 = base64.b64encode(output_buffer.getvalue()).decode('utf-8')
+
+        # 임시 파일 정리
+        for f in os.listdir("temp_audio"):
+            try: os.remove(os.path.join("temp_audio", f))
+            except: pass
 
         return {
             "user_text": user_text,
-            "phonetic": data.get('romanized',''),
-            "korean_text": k_sent,
-            "eng_meaning": data.get('eng_meaning',''),
-            "kor_explanation": k_expl,
-            "eng_explanation": data.get('eng_explanation',''),
-            "feedback": data.get('feedback',''),
+            "structured_data": data,
             "audio_base64": audio_b64
         }
 
     except Exception as e:
         print(f"Talk Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-    finally:
-        if os.path.exists(temp_filename):
-            os.remove(temp_filename)
 
 if __name__ == "__main__":
     import uvicorn
