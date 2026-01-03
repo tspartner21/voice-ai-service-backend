@@ -25,7 +25,7 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-# [PostgreSQL 설정] - 본인 설정에 맞게 변경
+# [PostgreSQL 설정] - 본인 환경에 맞게 수정
 DB_HOST = "localhost"
 DB_NAME = "quest_db"
 DB_USER = "postgres"
@@ -63,6 +63,8 @@ def init_db():
     if not conn: return
     try:
         cur = conn.cursor()
+
+        # 테이블 생성
         cur.execute("""
                     CREATE TABLE IF NOT EXISTS users (
                                                          username VARCHAR(50) PRIMARY KEY, password VARCHAR(50), role VARCHAR(20), full_name VARCHAR(50), created_at TIMESTAMP
@@ -84,9 +86,9 @@ def init_db():
                     ('1111', '1111', 'user', 'Tester 1111', get_kst_now()))
 
         seed_products = [
-            ("cafe_order", "basic", "☕ Ordering Coffee", "Free", "", "Order drinks", "Barista", "Cafe", '["Iced Americano, please"]'),
-            ("subway", "basic", "🚇 Subway Navigation", "Free", "", "Directions", "Citizen", "Subway Station", '["Where is Line 2?"]'),
-            ("quest_tour", "offline", "🏯 Palace Tour", "50,000", "https://via.placeholder.com/400", "Hanbok Tour", "Guide", "Gyeongbokgung", '["Take a photo please"]')
+            ("cafe_order", "basic", "☕ Ordering Coffee", "Free", "", "Order drinks like a local", "Barista", "Cafe", '["Iced Americano, please"]'),
+            ("subway", "basic", "🚇 Subway Navigation", "Free", "", "Asking for directions", "Citizen", "Subway Station", '["Where is Line 2?"]'),
+            ("quest_tour", "offline", "🏯 Palace Tour", "50,000", "https://via.placeholder.com/400", "Hanbok Photo Tour", "Guide", "Gyeongbokgung", '["Take a photo please"]')
         ]
         for p in seed_products:
             cur.execute("INSERT INTO products (id, category, title, price, image_url, description, persona, situation, examples) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (id) DO NOTHING", p)
@@ -104,7 +106,7 @@ class BookingRequest(BaseModel): username: str; theme_id: str; date: str; people
 class CancelRequest(BaseModel): booking_id: int
 class QuestRequest(BaseModel): username: str; theme_id: str
 
-# --- Logic ---
+# --- Deep Tech Logic ---
 def analyze_audio_similarity(user_path, target_path):
     try:
         y1, sr1 = librosa.load(user_path, sr=16000)
@@ -214,15 +216,18 @@ def generate_quest(req: QuestRequest):
     conn.close()
     context_text = row[0] if row else "Can I get an iced americano?"
 
-    sys_prompt = "You are a helpful Korean Tutor. Generate a NEW, APPLIED Korean sentence based on the user's previous sentence."
+    sys_prompt = "You are a helpful Korean Tutor. Generate a NEW, APPLIED Korean sentence."
     res = openai_client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role":"system", "content": sys_prompt}, {"role":"user", "content": f"Context: {context_text}. Create quest. JSON: {{'korean': '...', 'romanized': '...', 'english': '...', 'grammar': 'Eng explanation', 'context': 'Eng context'}}"}],
         response_format={"type": "json_object"}
     )
     data = json.loads(res.choices[0].message.content)
+
+    # Quest 문장 오디오 생성
     tts = openai_client.audio.speech.create(model="tts-1", voice="nova", input=data['korean'], speed=1.0)
     audio_b64 = base64.b64encode(tts.content).decode('utf-8')
+
     return {"quest_data": data, "audio_base64": audio_b64}
 
 @app.post("/talk")
@@ -288,8 +293,8 @@ async def talk(file: UploadFile = File(...), theme_id: str = Form(...), username
         conn.commit()
         conn.close()
 
-        full_text = f"{target_korean}. {data.get('context')}. {data.get('grammar')}"
-        tts_final = openai_client.audio.speech.create(model="tts-1", voice="nova", input=full_text, speed=1.0)
+        # [수정] 오디오에는 '한글 문장'만 담습니다 (컨텍스트 재생 방지)
+        tts_final = openai_client.audio.speech.create(model="tts-1", voice="nova", input=target_korean, speed=1.0)
         audio_b64 = base64.b64encode(tts_final.content).decode('utf-8')
 
         return {"user_text": user_text, "structured_data": data, "audio_base64": audio_b64}
