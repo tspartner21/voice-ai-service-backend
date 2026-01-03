@@ -25,7 +25,7 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-# [PostgreSQL 설정] - 본인 환경에 맞게 수정
+# [PostgreSQL 설정]
 DB_HOST = "localhost"
 DB_NAME = "quest_db"
 DB_USER = "postgres"
@@ -63,8 +63,6 @@ def init_db():
     if not conn: return
     try:
         cur = conn.cursor()
-
-        # 테이블 생성
         cur.execute("""
                     CREATE TABLE IF NOT EXISTS users (
                                                          username VARCHAR(50) PRIMARY KEY, password VARCHAR(50), role VARCHAR(20), full_name VARCHAR(50), created_at TIMESTAMP
@@ -106,7 +104,7 @@ class BookingRequest(BaseModel): username: str; theme_id: str; date: str; people
 class CancelRequest(BaseModel): booking_id: int
 class QuestRequest(BaseModel): username: str; theme_id: str
 
-# --- Deep Tech Logic ---
+# --- Logic ---
 def analyze_audio_similarity(user_path, target_path):
     try:
         y1, sr1 = librosa.load(user_path, sr=16000)
@@ -197,14 +195,37 @@ def cancel(req: CancelRequest):
     conn.close()
     return {"status": "success"}
 
+# [수정] user_text(문장) 추가 조회
 @app.get("/reports/{username}")
-def get_reports(username: str):
+def get_reports(username: str, page: int = 1, limit: int = 5):
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute("SELECT theme_id, tech_score, created_at FROM speaking_logs WHERE username=%s ORDER BY created_at DESC LIMIT 7", (username,))
+
+    cur.execute("SELECT COUNT(*) as total FROM speaking_logs WHERE username=%s", (username,))
+    total = cur.fetchone()['total']
+
+    offset = (page - 1) * limit
+    # user_text 추가됨
+    cur.execute("""
+                SELECT theme_id, tech_score, user_text, created_at
+                FROM speaking_logs
+                WHERE username=%s
+                ORDER BY created_at DESC
+                    LIMIT %s OFFSET %s
+                """, (username, limit, offset))
     rows = cur.fetchall()
+
+    cur.execute("SELECT tech_score, created_at FROM speaking_logs WHERE username=%s ORDER BY created_at DESC LIMIT 7", (username,))
+    graph_data = cur.fetchall()
+
     conn.close()
-    return rows
+    return {
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "logs": rows,
+        "graph": graph_data
+    }
 
 @app.post("/quest")
 def generate_quest(req: QuestRequest):
@@ -223,11 +244,8 @@ def generate_quest(req: QuestRequest):
         response_format={"type": "json_object"}
     )
     data = json.loads(res.choices[0].message.content)
-
-    # Quest 문장 오디오 생성
     tts = openai_client.audio.speech.create(model="tts-1", voice="nova", input=data['korean'], speed=1.0)
     audio_b64 = base64.b64encode(tts.content).decode('utf-8')
-
     return {"quest_data": data, "audio_base64": audio_b64}
 
 @app.post("/talk")
@@ -293,8 +311,8 @@ async def talk(file: UploadFile = File(...), theme_id: str = Form(...), username
         conn.commit()
         conn.close()
 
-        # [수정] 오디오에는 '한글 문장'만 담습니다 (컨텍스트 재생 방지)
-        tts_final = openai_client.audio.speech.create(model="tts-1", voice="nova", input=target_korean, speed=1.0)
+        full_text = f"{target_korean}. {data.get('context')}"
+        tts_final = openai_client.audio.speech.create(model="tts-1", voice="nova", input=full_text, speed=1.0)
         audio_b64 = base64.b64encode(tts_final.content).decode('utf-8')
 
         return {"user_text": user_text, "structured_data": data, "audio_base64": audio_b64}
