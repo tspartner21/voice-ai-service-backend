@@ -100,7 +100,7 @@ def analyze_audio_similarity(user_path, target_path):
         avg_dist = dist / len(path)
         print(f"🧮 패턴 거리(Cosine): {avg_dist:.4f}")
 
-        # 임계값 설정 (Cosine 거리는 보통 0~2 사이, 0이 완전 일치)
+        # 임계값 설정 (Cosine 거리는 보통 0~2 사이)
         base_threshold = 0.6
 
         if avg_dist > base_threshold:
@@ -196,6 +196,7 @@ async def talk_to_ai(file: UploadFile = File(...), theme_id: str = Form(...)):
     filename = file.filename
     print(f"📁 오디오 업로드: {filename}")
 
+    # 확장자 유지하여 저장 (중요)
     user_audio_path = f"temp_audio/input_{filename}"
     target_audio_path = f"temp_audio/target_{filename}.mp3"
 
@@ -203,7 +204,7 @@ async def talk_to_ai(file: UploadFile = File(...), theme_id: str = Form(...)):
         with open(user_audio_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # 1. Whisper STT (힌트 제공)
+        # 1. Whisper STT
         print("🎤 STT 변환 중...")
         with open(user_audio_path, "rb") as audio_file:
             transcript = openai_client.audio.transcriptions.create(
@@ -225,7 +226,7 @@ async def talk_to_ai(file: UploadFile = File(...), theme_id: str = Form(...)):
                 if row: persona, situation = row
         except: pass
 
-        # 3. LLM 호출 (문법/설명/번역)
+        # 3. LLM 호출
         SYSTEM_PROMPT = f"""
         Role: You are '{persona}' in '{situation}'.
         Task: User speaks English. Provide natural Korean translation.
@@ -251,15 +252,15 @@ async def talk_to_ai(file: UploadFile = File(...), theme_id: str = Form(...)):
         data = json.loads(response.choices[0].message.content)
         target_korean = data.get("korean", "다시 시도해주세요.")
 
-        # 4. [Deep Tech] 비교용 원어민 오디오 생성
+        # 4. 비교용 오디오 생성
         tts_res = openai_client.audio.speech.create(model="tts-1", voice="nova", input=target_korean, speed=1.0)
         tts_res.stream_to_file(target_audio_path)
 
-        # 5. [Deep Tech] 유사도 분석
+        # 5. 유사도 분석
         score = analyze_audio_similarity(user_audio_path, target_audio_path)
         data['tech_score'] = score
 
-        # 6. 전체 오디오 생성 (문장 + 설명)
+        # 6. 최종 재생용 오디오 (문장 + 설명)
         full_text = f"{target_korean}... {data.get('explanation')}... 중요 문법은 {data.get('grammar_point')} 입니다."
         full_tts = openai_client.audio.speech.create(model="tts-1", voice="nova", input=full_text, speed=1.0)
         audio_b64 = base64.b64encode(full_tts.content).decode('utf-8')
