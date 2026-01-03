@@ -1,10 +1,11 @@
 import os
 import shutil
 import json
-import sqlite3
 import base64
 import numpy as np
 import librosa
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from fastdtw import fastdtw
 from scipy.spatial.distance import cosine
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
@@ -19,11 +20,25 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
+# [중요] PostgreSQL 접속 정보 (본인 환경에 맞게 수정 필수)
+DB_HOST = "localhost"
+DB_NAME = "quest_db"
+DB_USER = "postgres"
+DB_PASSWORD = "1234"  # <--- 본인 비밀번호 입력
+DB_PORT = "5432"
+
 app = FastAPI()
+
+# CORS 설정 (프론트엔드 포트 허용)
+origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -33,31 +48,87 @@ os.makedirs("static/images", exist_ok=True)
 os.makedirs("temp_audio", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-DB_NAME = "bookings.db"
-
-# --- DB 초기화 ---
-def init_db():
+# --- 2. DB 연결 및 초기화 ---
+def get_db_connection():
     try:
-        with sqlite3.connect(DB_NAME) as conn:
-            cursor = conn.cursor()
-            cursor.execute('''CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user', full_name TEXT, phone TEXT, address TEXT)''')
-            cursor.execute('''CREATE TABLE IF NOT EXISTS products (id TEXT PRIMARY KEY, category TEXT, title TEXT, price TEXT, rating TEXT, image_url TEXT, desc TEXT, persona TEXT, situation TEXT, mission TEXT, examples TEXT)''')
-            cursor.execute('''CREATE TABLE IF NOT EXISTS bookings (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, theme_id TEXT, theme_title TEXT, start_date TEXT, end_date TEXT, people INTEGER, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
-
-            cursor.execute("INSERT OR IGNORE INTO users (username, password, role, full_name) VALUES ('admin', 'admin', 'admin', 'Admin')")
-            cursor.execute("INSERT OR IGNORE INTO users (username, password, role, full_name) VALUES ('user', 'user', 'user', 'Tester')")
-
-            seed_data = [
-                ("kpop", "basic", "🎤 K-POP 콘서트", "Free", "5.0", "", "콘서트장 상황극", "열정적인 MC", "콘서트장", "응원하기", '["Scream!", "Encore!"]'),
-                ("store", "basic", "🏪 편의점 알바", "Free", "5.0", "", "편의점 상황극", "친절한 알바생", "편의점", "계산하기", '["How much?", "I need a bag."]'),
-                ("date", "basic", "💕 홍대 첫 데이트", "Free", "5.0", "", "데이트 상황극", "설레는 상대방", "홍대 맛집", "주문하기", '["You look pretty.", "Lets eat."]'),
-                ("offline_hongdae", "offline", "🔥 홍대 언어교환", "35,000원", "4.9", "https://via.placeholder.com/400", "현지인 친구", "모임장", "언어교환", "자기소개", '["Hello"]')
-            ]
-            for p in seed_data:
-                cursor.execute("INSERT OR IGNORE INTO products VALUES (?,?,?,?,?,?,?,?,?,?,?)", p)
-            conn.commit()
+        conn = psycopg2.connect(
+            host=DB_HOST, database=DB_NAME, user=DB_USER, password=DB_PASSWORD, port=DB_PORT
+        )
+        return conn
     except Exception as e:
-        print(f"DB Init Error: {e}")
+        print(f"❌ DB 연결 실패: {e}")
+        return None
+
+def init_db():
+    print("🔄 DB 초기화 중...")
+    conn = get_db_connection()
+    if not conn:
+        print("❌ DB 연결 불가. PostgreSQL이 켜져있는지, 'quest_db'가 존재하는지 확인하세요.")
+        return
+
+    try:
+        cur = conn.cursor()
+
+        # 테이블 생성
+        cur.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                                                         username VARCHAR(50) PRIMARY KEY,
+                        password VARCHAR(50) NOT NULL,
+                        role VARCHAR(20) DEFAULT 'user',
+                        full_name VARCHAR(50),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        );
+                    """)
+        cur.execute("""
+                    CREATE TABLE IF NOT EXISTS products (
+                                                            id VARCHAR(50) PRIMARY KEY,
+                        category VARCHAR(20),
+                        title VARCHAR(100),
+                        price VARCHAR(50),
+                        image_url TEXT,
+                        description TEXT,
+                        persona VARCHAR(50),
+                        situation VARCHAR(50),
+                        examples TEXT
+                        );
+                    """)
+        cur.execute("""
+                    CREATE TABLE IF NOT EXISTS speaking_logs (
+                                                                 id SERIAL PRIMARY KEY,
+                                                                 username VARCHAR(50),
+                        theme_id VARCHAR(50),
+                        user_text TEXT,
+                        tech_score INT,
+                        feedback TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        );
+                    """)
+
+        # 기초 데이터 삽입
+        cur.execute("INSERT INTO users (username, password, role, full_name) VALUES (%s, %s, %s, %s) ON CONFLICT (username) DO NOTHING", ('admin', 'admin', 'admin', 'Admin'))
+        cur.execute("INSERT INTO users (username, password, role, full_name) VALUES (%s, %s, %s, %s) ON CONFLICT (username) DO NOTHING", ('1111', '1111', 'user', 'Tester 1111'))
+
+        seed_products = [
+            ("kpop", "basic", "🎤 K-POP 콘서트", "Free", "", "콘서트장 상황극", "열정적인 MC", "콘서트장", '["Scream!", "Encore!"]'),
+            ("store", "basic", "🏪 편의점 알바", "Free", "", "편의점 상황극", "친절한 알바생", "편의점", '["How much?", "I need a bag."]'),
+            ("date", "basic", "💕 홍대 첫 데이트", "Free", "", "데이트 상황극", "설레는 상대방", "홍대 맛집", '["You look pretty.", "Lets eat."]'),
+            ("offline_hongdae", "offline", "🔥 홍대 언어교환", "35,000원", "https://via.placeholder.com/400", "현지인 친구 사귀기", "모임장", "언어교환", '["Hello"]')
+        ]
+        for p in seed_products:
+            cur.execute("""
+                        INSERT INTO products (id, category, title, price, image_url, description, persona, situation, examples)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (id) DO NOTHING
+                        """, p)
+
+        conn.commit()
+        print("✅ PostgreSQL DB 준비 완료")
+    except Exception as e:
+        print(f"❌ DB Init Error: {e}")
+        conn.rollback()
+    finally:
+        cur.close()
+        conn.close()
 
 init_db()
 
@@ -65,198 +136,156 @@ init_db()
 class AuthRequest(BaseModel):
     username: str; password: str
 class RegisterRequest(BaseModel):
-    username: str; password: str; full_name: str; phone: str; address: str
-class BookingRequest(BaseModel):
-    username: str; theme_id: str; start_date: str; end_date: str; people: int
-class CancelRequest(BaseModel):
-    booking_id: int
+    username: str; password: str; full_name: str
 
-# --- [Deep Tech] 오디오 유사도 분석 (MFCC + DTW + Cosine) ---
+# --- 딥테크 알고리즘 (MFCC + DTW + Cosine) ---
 def analyze_audio_similarity(user_path, target_path):
-    print(f"📡 [Deep Tech] 신호 정밀 분석 시작: {user_path}")
+    print(f"📡 신호 분석 시작: {user_path}")
     try:
-        # 1. 오디오 로드 (16kHz)
         y1, sr1 = librosa.load(user_path, sr=16000)
         y2, sr2 = librosa.load(target_path, sr=16000)
-
-        # 2. 전처리: 무음 제거 (Trim)
         y1, _ = librosa.effects.trim(y1)
         y2, _ = librosa.effects.trim(y2)
 
-        # 3. MFCC 특징 추출
         mfcc1 = librosa.feature.mfcc(y=y1, sr=sr1, n_mfcc=13)
         mfcc2 = librosa.feature.mfcc(y=y2, sr=sr2, n_mfcc=13)
 
-        # 4. CMN (Cepstral Mean Normalization) - 톤 보정
+        # CMN 정규화 (음색 제거)
         mfcc1 -= (np.mean(mfcc1, axis=1, keepdims=True) + 1e-8)
         mfcc2 -= (np.mean(mfcc2, axis=1, keepdims=True) + 1e-8)
 
-        # 5. DTW + Cosine Distance
         dist, path = fastdtw(mfcc1.T, mfcc2.T, dist=cosine, radius=10)
-
-        # 6. 점수화 로직
         avg_dist = dist / len(path)
-        print(f"🧮 패턴 거리(Cosine): {avg_dist:.4f}")
 
-        base_threshold = 0.6
-        if avg_dist > base_threshold:
-            final_score = 10
-        else:
-            similarity = 1 - (avg_dist / base_threshold)
-            final_score = int(similarity * 100)
+        # 점수 스케일링
+        if avg_dist > 0.6: final_score = 10
+        else: final_score = int((1 - (avg_dist / 0.6)) * 100)
 
-        if final_score > 60:
-            final_score = min(100, final_score + 15)
+        if final_score > 60: final_score = min(100, final_score + 15)
 
-        print(f"✅ 최종 산출 점수: {final_score}")
+        print(f"✅ 최종 점수: {final_score}")
         return final_score
-
     except Exception as e:
-        print(f"❌ 분석 실패: {e}")
+        print(f"Algorithm Error: {e}")
         return 0
 
-# --- API Endpoints ---
-@app.get("/themes")
-def get_themes():
-    try:
-        with sqlite3.connect(DB_NAME) as conn:
-            conn.row_factory = sqlite3.Row
-            rows = conn.cursor().execute("SELECT * FROM products").fetchall()
-            themes = {}
-            for row in rows:
-                item = dict(row)
-                try: item['examples'] = json.loads(item['examples'])
-                except: item['examples'] = ["Hello"]
-                if item['category'] == 'basic': item['icon'] = "📚"
-                themes[item['id']] = item
-            return themes
-    except: return {}
-
+# --- API ---
 @app.post("/login")
 def login(req: AuthRequest):
-    with sqlite3.connect(DB_NAME) as conn:
-        user = conn.cursor().execute("SELECT username, role FROM users WHERE username=? AND password=?", (req.username, req.password)).fetchone()
-    if user: return {"status": "success", "username": user[0], "role": user[1]}
-    raise HTTPException(status_code=401, detail="Login failed")
+    conn = get_db_connection()
+    if not conn: raise HTTPException(status_code=500, detail="DB Error")
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT username, role FROM users WHERE username=%s AND password=%s", (req.username, req.password))
+        user = cur.fetchone()
+        conn.close()
+        if user: return {"status": "success", "username": user[0], "role": user[1]}
+        raise HTTPException(status_code=401, detail="로그인 실패: 아이디/비번을 확인하세요.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/register")
 def register(req: RegisterRequest):
+    conn = get_db_connection()
+    if not conn: raise HTTPException(status_code=500, detail="DB Error")
     try:
-        with sqlite3.connect(DB_NAME) as conn:
-            if conn.cursor().execute("SELECT username FROM users WHERE username=?", (req.username,)).fetchone():
-                raise HTTPException(status_code=400, detail="User exists")
-            conn.cursor().execute("INSERT INTO users (username, password, role, full_name, phone, address) VALUES (?, ?, 'user', ?, ?, ?)", (req.username, req.password, req.full_name, req.phone, req.address))
-            conn.commit()
-        return {"status": "success"}
-    except: raise HTTPException(status_code=500, detail="Error")
-
-@app.post("/book")
-def book(req: BookingRequest):
-    try:
-        with sqlite3.connect(DB_NAME) as conn:
-            row = conn.cursor().execute("SELECT title FROM products WHERE id=?", (req.theme_id,)).fetchone()
-            title = row[0] if row else "Unknown"
-            conn.cursor().execute("INSERT INTO bookings (username, theme_id, theme_title, start_date, end_date, people) VALUES (?,?,?,?,?,?)", (req.username, req.theme_id, title, req.start_date, req.end_date, req.people))
-            conn.commit()
-        return {"status": "success"}
-    except: raise HTTPException(status_code=500, detail="Error")
-
-@app.get("/bookings/my")
-def my_bookings(username: str):
-    try:
-        with sqlite3.connect(DB_NAME) as conn:
-            conn.row_factory = sqlite3.Row
-            return [dict(r) for r in conn.cursor().execute("SELECT * FROM bookings WHERE username=? ORDER BY id DESC", (username,)).fetchall()]
-    except: return []
-
-@app.get("/bookings/all")
-def all_bookings():
-    try:
-        with sqlite3.connect(DB_NAME) as conn:
-            conn.row_factory = sqlite3.Row
-            return [dict(r) for r in conn.cursor().execute("SELECT * FROM bookings ORDER BY id DESC").fetchall()]
-    except: return []
-
-@app.post("/bookings/cancel")
-def cancel(req: CancelRequest):
-    with sqlite3.connect(DB_NAME) as conn:
-        conn.cursor().execute("DELETE FROM bookings WHERE id=?", (req.booking_id,))
+        cur = conn.cursor()
+        cur.execute("INSERT INTO users (username, password, full_name) VALUES (%s, %s, %s)", (req.username, req.password, req.full_name))
         conn.commit()
-    return {"status": "success"}
+        return {"status": "success"}
+    except:
+        raise HTTPException(status_code=400, detail="이미 존재하는 ID입니다.")
+    finally: conn.close()
 
-# --- AI Talk ---
+@app.get("/themes")
+def get_themes():
+    conn = get_db_connection()
+    if not conn: return {}
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT * FROM products")
+    rows = cur.fetchall()
+    conn.close()
+
+    themes = {}
+    for row in rows:
+        item = dict(row)
+        try: item['examples'] = json.loads(item['examples'])
+        except: item['examples'] = []
+        if item['category'] == 'basic': item['icon'] = "📚"
+        themes[item['id']] = item
+    return themes
+
+@app.get("/reports/{username}")
+def get_reports(username: str):
+    conn = get_db_connection()
+    if not conn: return []
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT theme_id, tech_score, created_at FROM speaking_logs WHERE username = %s ORDER BY created_at DESC LIMIT 20", (username,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
 @app.post("/talk")
-async def talk_to_ai(file: UploadFile = File(...), theme_id: str = Form(...)):
+async def talk_to_ai(file: UploadFile = File(...), theme_id: str = Form(...), username: str = Form(...)):
     filename = file.filename
-    print(f"📁 오디오 업로드: {filename}")
-
-    user_audio_path = f"temp_audio/input_{filename}"
-    target_audio_path = f"temp_audio/target_{filename}.mp3"
+    # 확장자 유지
+    user_path = f"temp_audio/in_{filename}"
+    target_path = f"temp_audio/tgt_{filename}.mp3"
 
     try:
-        with open(user_audio_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        with open(user_path, "wb") as buffer: shutil.copyfileobj(file.file, buffer)
 
-        # 1. Whisper STT
-        print("🎤 STT 변환 중...")
-        with open(user_audio_path, "rb") as audio_file:
+        # 1. STT
+        with open(user_path, "rb") as af:
             transcript = openai_client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file,
-                prompt="The user speaks English. Please transcribe accurately."
+                model="whisper-1", file=af,
+                prompt="English conversation input." # 힌트 추가
             )
         user_text = transcript.text
-        print(f"🗣️ 인식된 텍스트: {user_text}")
+        if not user_text.strip(): return {"error": "목소리가 너무 작거나 없습니다."}
 
-        if len(user_text.strip()) < 1:
-            return {"error": "목소리가 감지되지 않았습니다."}
-
-        # 2. 페르소나 조회
+        # 2. 페르소나
+        conn = get_db_connection()
         persona, situation = "Tutor", "Practice"
-        try:
-            with sqlite3.connect(DB_NAME) as conn:
-                row = conn.cursor().execute("SELECT persona, situation FROM products WHERE id=?", (theme_id,)).fetchone()
-                if row: persona, situation = row
-        except: pass
+        if conn:
+            cur = conn.cursor()
+            cur.execute("SELECT persona, situation FROM products WHERE id=%s", (theme_id,))
+            res = cur.fetchone()
+            conn.close()
+            if res: persona, situation = res
 
-        # 3. LLM 호출
-        SYSTEM_PROMPT = f"""
-        Role: You are '{persona}' in '{situation}'.
-        Task: User speaks English. Provide natural Korean translation.
-        Output JSON Only:
-        {{
-            "korean": "Target Korean sentence",
-            "romanized": "...",
-            "english": "...",
-            "grammar_point": "Key grammar rule",
-            "explanation": "Context explanation"
-        }}
-        """
-
+        # 3. LLM
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"User said: '{user_text}'. Return JSON."}
+                {"role": "system", "content": f"Role: {persona} in {situation}. Task: Translate English to Korean. Output JSON: {{'korean': '...', 'romanized': '...', 'english': '...', 'grammar': '...', 'expl': '...'}}"},
+                {"role": "user", "content": f"User: {user_text}. Return JSON."}
             ],
-            response_format={ "type": "json_object" }
+            response_format={"type": "json_object"}
         )
-
         data = json.loads(response.choices[0].message.content)
-        target_korean = data.get("korean", "다시 시도해주세요.")
+        target_korean = data.get("korean", "다시 말해주세요.")
 
-        # 4. 비교용 오디오 생성
-        tts_res = openai_client.audio.speech.create(model="tts-1", voice="nova", input=target_korean, speed=1.0)
-        tts_res.stream_to_file(target_audio_path)
+        # 4. 딥테크 (TTS 생성 및 비교)
+        tts_tgt = openai_client.audio.speech.create(model="tts-1", voice="nova", input=target_korean, speed=1.0)
+        tts_tgt.stream_to_file(target_path)
 
-        # 5. 유사도 분석
-        score = analyze_audio_similarity(user_audio_path, target_audio_path)
+        score = analyze_audio_similarity(user_path, target_path)
         data['tech_score'] = score
 
-        # 6. 전체 오디오 생성 (문장 + 설명)
-        full_text = f"{target_korean}... {data.get('explanation')}... 중요 문법은 {data.get('grammar_point')} 입니다."
-        full_tts = openai_client.audio.speech.create(model="tts-1", voice="nova", input=full_text, speed=1.0)
-        audio_b64 = base64.b64encode(full_tts.content).decode('utf-8')
+        # 5. DB 저장
+        conn = get_db_connection()
+        if conn:
+            cur = conn.cursor()
+            cur.execute("INSERT INTO speaking_logs (username, theme_id, user_text, tech_score, feedback) VALUES (%s, %s, %s, %s, %s)",
+                        (username, theme_id, user_text, score, data.get('expl', '')))
+            conn.commit()
+            conn.close()
+
+        # 6. 결과 오디오
+        full_text = f"{target_korean}. {data.get('expl')}"
+        tts_final = openai_client.audio.speech.create(model="tts-1", voice="nova", input=full_text, speed=1.0)
+        audio_b64 = base64.b64encode(tts_final.content).decode('utf-8')
 
         return {
             "user_text": user_text,
@@ -265,13 +294,11 @@ async def talk_to_ai(file: UploadFile = File(...), theme_id: str = Form(...)):
         }
 
     except Exception as e:
-        print(f"🚨 Server Error: {e}")
+        print(f"Server Error: {e}")
         return {"error": str(e)}
     finally:
-        for p in [user_audio_path, target_audio_path]:
-            if os.path.exists(p):
-                try: os.remove(p)
-                except: pass
+        for p in [user_path, target_path]:
+            if os.path.exists(p): os.remove(p)
 
 if __name__ == "__main__":
     import uvicorn
