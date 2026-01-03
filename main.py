@@ -71,7 +71,7 @@ class BookingRequest(BaseModel):
 class CancelRequest(BaseModel):
     booking_id: int
 
-# --- [Deep Tech Algorithm] 고도화된 오디오 유사도 분석 ---
+# --- [Deep Tech] 오디오 유사도 분석 (MFCC + DTW + Cosine) ---
 def analyze_audio_similarity(user_path, target_path):
     print(f"📡 [Deep Tech] 신호 정밀 분석 시작: {user_path}")
     try:
@@ -83,34 +83,28 @@ def analyze_audio_similarity(user_path, target_path):
         y1, _ = librosa.effects.trim(y1)
         y2, _ = librosa.effects.trim(y2)
 
-        # 3. MFCC 특징 추출 (n_mfcc=13)
+        # 3. MFCC 특징 추출
         mfcc1 = librosa.feature.mfcc(y=y1, sr=sr1, n_mfcc=13)
         mfcc2 = librosa.feature.mfcc(y=y2, sr=sr2, n_mfcc=13)
 
-        # 4. [핵심 기술 1] CMN (Cepstral Mean Normalization)
-        # 성우와 사용자의 '음색(Tone)' 차이를 제거하고 '발음 패턴'만 남김
+        # 4. CMN (Cepstral Mean Normalization) - 톤 보정
         mfcc1 -= (np.mean(mfcc1, axis=1, keepdims=True) + 1e-8)
         mfcc2 -= (np.mean(mfcc2, axis=1, keepdims=True) + 1e-8)
 
-        # 5. [핵심 기술 2] DTW + Cosine Distance
-        # 유클리드 거리 대신 코사인 거리를 사용하여 '패턴 유사도' 측정
+        # 5. DTW + Cosine Distance
         dist, path = fastdtw(mfcc1.T, mfcc2.T, dist=cosine, radius=10)
 
-        # 6. 점수화 로직 (Calibrated Scoring)
+        # 6. 점수화 로직
         avg_dist = dist / len(path)
         print(f"🧮 패턴 거리(Cosine): {avg_dist:.4f}")
 
-        # 임계값 설정 (Cosine 거리는 보통 0~2 사이)
         base_threshold = 0.6
-
         if avg_dist > base_threshold:
             final_score = 10
         else:
-            # 선형 비례 점수화
             similarity = 1 - (avg_dist / base_threshold)
             final_score = int(similarity * 100)
 
-        # 보너스 점수 (패턴이 일정 수준 이상 맞으면 가산점)
         if final_score > 60:
             final_score = min(100, final_score + 15)
 
@@ -190,13 +184,12 @@ def cancel(req: CancelRequest):
         conn.commit()
     return {"status": "success"}
 
-# --- [핵심] Deep Tech AI Talk ---
+# --- AI Talk ---
 @app.post("/talk")
 async def talk_to_ai(file: UploadFile = File(...), theme_id: str = Form(...)):
     filename = file.filename
     print(f"📁 오디오 업로드: {filename}")
 
-    # 확장자 유지하여 저장 (중요)
     user_audio_path = f"temp_audio/input_{filename}"
     target_audio_path = f"temp_audio/target_{filename}.mp3"
 
@@ -260,7 +253,7 @@ async def talk_to_ai(file: UploadFile = File(...), theme_id: str = Form(...)):
         score = analyze_audio_similarity(user_audio_path, target_audio_path)
         data['tech_score'] = score
 
-        # 6. 최종 재생용 오디오 (문장 + 설명)
+        # 6. 전체 오디오 생성 (문장 + 설명)
         full_text = f"{target_korean}... {data.get('explanation')}... 중요 문법은 {data.get('grammar_point')} 입니다."
         full_tts = openai_client.audio.speech.create(model="tts-1", voice="nova", input=full_text, speed=1.0)
         audio_b64 = base64.b64encode(full_tts.content).decode('utf-8')
